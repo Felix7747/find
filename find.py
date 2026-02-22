@@ -11,10 +11,6 @@ import logging
 import time
 start_time = time.time()
 
-
-
-
-
 class duplicateItem:
 	def __init__(self):
 		self.hash = 0
@@ -72,22 +68,30 @@ def check_not_in_exclude(dirpath, filename):
 	if(args.exclude):
 		for excludeString in args.exclude:
 			if not (full_path.find(excludeString) == -1):
-				logging.info ("Excluding due to \"", excludeString, "\" being found in ", full_path)
+				logging.info ("Excluding due to %s being found in %s", excludeString, full_path)
 				return False
 	for excludePath in vmPathList:
 		if not (dirpath.find(excludePath) == -1):
-			logging.info ("Excluding due to \"", excludePath, "\" path found in ", full_path)
+			logging.info ("Excluding due to %s path found in %s", excludePath, full_path)
 			return False
 	if(args.incVMs):
 		for excludeString in vmFileList:
 			if not (full_path.find(excludeString) == -1):
-				logging.info ("Excluding due to \"", excludeString, "\" being found in ", full_path)
+				logging.info ("Excluding due to %s being found in %s", excludeString, full_path)
 				vmPathList.append(dirpath)
 				return False
 	return True
-	
+
+mediaFileList = [".jpg",".jpeg",".bmp",".tiff",".gif",".mov",".mp3",".mp4",".wav",".mpeg",".mpg",".png",".tif"]
+mediaPathList = list()
 def check_in_include(dirpath, filename):
 	full_path = os.path.join(dirpath, filename).lower()
+	#if(args.incMedia):
+	#for includeString in vmFileList:
+	#	if (full_path.find(includeString) == -1):
+	#		logging.info ("Including due to %s being found in %s", includeString, full_path)
+	#		mediaPathList.append(dirpath)
+	#		return False
 	if(args.include):
 		for includeString in args.include:
 			if not (full_path.find(includeString.lower()) == -1):
@@ -215,9 +219,9 @@ delListPath = list()
 delList = list()
 delPaths = list()
 def addToDeletion():
-	print ("Unique Files: ", len(dupeList))
+	# print ("Unique Files: ", len(dupeList))
 	for dupe in dupeList:	#Loop through each set of duplicates
-		print ("Count of this file: ", dupe.dupeCount)
+		# print ("Count of this file: ", dupe.dupeCount)
 		tryCount = 0	#Overall attempt count
 		delIndex = 0	#Index of paths to check through
 		maxCheckLen = len(delListPath)*len(dupe.filename)
@@ -242,15 +246,15 @@ def addToDeletion():
 			if(tryCount > maxCheckLen):
 				raise ValueError('addToDeletion: tryCount exceeded macCheckLen. This should not happen.')
 				check = False
-		print ("Try Count: ",tryCount, "CheckLen: ", maxCheckLen)
+		# print ("Try Count: ",tryCount, "CheckLen: ", maxCheckLen)
 
 def pathsToFile():
-	with open('dupelicate_files_path_list.txt', 'w') as filehandle:
+	with open('duplicate_files_path_list.txt', 'w') as filehandle:
 		for listitem in getDupePaths():
 			filehandle.write('%s\n' % listitem)
 
 def pathsFromFile():
-	with open('dupelicate_files_path_list.txt', 'r') as filehandle:
+	with open('duplicate_files_path_list.txt', 'r') as filehandle:
 		for line in filehandle:
 			currentPlace = line[:-1]
 			delListPath.append(currentPlace)
@@ -277,7 +281,7 @@ def hashedListFromFile():
 	return newList
 
 def deleteItems():
-	logging.info ("Number of items for deletion: ", len(delList))
+	logging.info ("Number of items for deletion: %s", len(delList))
 	for item in delList:
 		os.remove(item)
 		pass
@@ -321,14 +325,17 @@ parser.add_argument('--miniHashSize', metavar='bytes',dest='miniSize', type=int,
 					help='Size (in Bytes) to use for Mini Hash check.')
 parser.add_argument('--incvms', dest='incVMs', default=True, const=False, nargs='?',
 					required=False, help='Setting [True] allows deletion of detected Virtual Machine files which may have valid duplicates.')
+parser.add_argument('--media', dest='incMedia', default=False, const=False, nargs='?',
+					required=False, help='Setting [True] searched only media files.')
 
 args = parser.parse_args()
-logging.basicConfig(filename='find.log',level=logging.ERROR)
+logging.basicConfig(filename='find.log',level=logging.INFO)
 
 if (args.mode[0].lower() == "find"):
 	targetList = args.target
 	print ("Find Mode")
 	checkArgs(targetList)
+	print ("Exclude List: ", args.exclude)
 	check_for_duplicates(args.target)
 	hashedListToFile()
 	pathsToFile()
