@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.12
 """
 Duplicate File Finder - Finds and optionally deletes duplicate files.
 
@@ -29,6 +29,21 @@ MEDIA_EXTENSIONS = {".jpg", ".jpeg", ".bmp", ".tiff", ".gif", ".mov", ".mp3", ".
                     ".wav", ".mpeg", ".mpg", ".png", ".tif", ".tiff", ".webp", ".avi"}
 
 
+# Version check
+def check_python_version():
+    """Check if running Python 3.12 or higher."""
+    if sys.version_info < (3, 12):
+        print(f"Error: Python 3.12+ required. You are running Python {sys.version_info.major}.{sys.version_info.minor}")
+        print("Please install Python 3.12 or higher:")
+        print("  sudo apt install python3.12  # Debian/Ubuntu")
+        print("  sudo dnf install python3.12  # Fedora")
+        print("  brew install python3.12      # macOS")
+        sys.exit(1)
+
+
+check_python_version()
+
+
 @dataclass
 class DuplicateGroup:
     """Represents a group of duplicate files."""
@@ -42,7 +57,13 @@ class DuplicateGroup:
     @property
     def total_size(self) -> int:
         """Total size of all files in this group."""
-        return sum(f.stat().st_size for f in self.files if f.exists())
+        total = 0
+        for f in self.files:
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+        return total
 
 
 @dataclass
@@ -110,11 +131,16 @@ class DuplicateFinder:
         path_str = str(path).lower()
         return any(pattern.lower() in path_str for pattern in include_patterns)
     
+    def _is_media_file(self, file_path: Path) -> bool:
+        """Check if file is a media file based on extension."""
+        return file_path.suffix.lower() in MEDIA_EXTENSIONS
+    
     def scan_for_duplicates(self, 
                            paths: list[Path], 
                            exclude_patterns: Optional[list[str]] = None,
                            include_patterns: Optional[list[str]] = None,
-                           exclude_vm_files: bool = True) -> ScanResult:
+                           exclude_vm_files: bool = True,
+                           media_only: bool = False) -> ScanResult:
         """
         Scan directories for duplicate files.
         
@@ -132,6 +158,10 @@ class DuplicateFinder:
         for search_path in paths:
             for file_path in search_path.rglob('*'):
                 if not file_path.is_file():
+                    continue
+                
+                # Check if media-only mode is enabled
+                if media_only and not self._is_media_file(file_path):
                     continue
                 
                 # Check exclusions/inclusions
@@ -343,9 +373,12 @@ def setup_logging(log_file: str = "find.log"):
 
 def validate_arguments(args) -> list[Path]:
     """Validate command line arguments."""
-    if not args.target:
+    if args.mode == 'find' and not args.target:
         print("Error: --target is required in find mode")
         sys.exit(1)
+    
+    if not args.target:
+        return []
     
     # Convert to Path objects and validate
     target_paths = [Path(t).resolve() for t in args.target]
@@ -415,6 +448,11 @@ Examples:
         help='Only include files matching these strings (case-insensitive)'
     )
     parser.add_argument(
+        '--media',
+        action='store_true',
+        help='Only search media files (photos, videos, audio)'
+    )
+    parser.add_argument(
         '--mini-hash-size',
         type=int,
         default=DEFAULT_MINI_HASH_SIZE,
@@ -445,6 +483,7 @@ Examples:
             logger.info(f"Starting duplicate scan in: {target_paths}")
             logger.info(f"Exclude patterns: {args.exclude}")
             logger.info(f"Include patterns: {args.include}")
+            logger.info(f"Media only mode: {args.media}")
             
             # Create finder and scan
             finder = DuplicateFinder(mini_hash_size=args.mini_hash_size)
@@ -452,7 +491,8 @@ Examples:
                 paths=target_paths,
                 exclude_patterns=args.exclude,
                 include_patterns=args.include,
-                exclude_vm_files=not args.include_vm
+                exclude_vm_files=not args.include_vm,
+                media_only=args.media
             )
             
             # Create manager and save results
