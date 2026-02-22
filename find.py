@@ -1,358 +1,548 @@
-#!/usr/bin/env python3
-import sys
-import os
-import hashlib
-import ntpath
-import os
+#!/usr/bin/env python3.12
+"""
+Duplicate File Finder - Finds and optionally deletes duplicate files.
+
+Usage:
+    python duplicate_finder.py --mode find --target /path/to/search
+    python duplicate_finder.py --mode delete
+    python duplicate_finder.py --mode dryrun
+"""
+
 import argparse
-import atexit
-import pickle
+import hashlib
 import logging
+import os
+import pickle
+import sys
 import time
-start_time = time.time()
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
-class duplicateItem:
-	def __init__(self):
-		self.hash = 0
-		self.filename = list()
-		self.dupeNo = -1
-		self.path = list()
-		self.name = list()
-		self.dupeCount = 0
+# Configuration
+DEFAULT_CHUNK_SIZE = 8192  # 8KB chunks for better performance
+DEFAULT_MINI_HASH_SIZE = 1024
 
-def goodbye():
-	parser.print_help(sys.stderr)
-	sys.exit(0)
+# File extension categories
+VM_EXTENSIONS = {".vmdk", ".vmx", ".vmsd", ".vmxf", ".lck", ".appinfo", ".nvram", ".vmem", ".vmss"}
+MEDIA_EXTENSIONS = {".jpg", ".jpeg", ".bmp", ".tiff", ".gif", ".mov", ".mp3", ".mp4", 
+                    ".wav", ".mpeg", ".mpg", ".png", ".tif", ".tiff", ".webp", ".avi"}
 
-def getName(filename):
-	return os.path.basename(filename)
 
-def getPath(filename):
-	return os.path.split(filename)[0]
+# Version check
+def check_python_version():
+    """Check if running Python 3.12 or higher."""
+    if sys.version_info < (3, 12):
+        print(f"Error: Python 3.12+ required. You are running Python {sys.version_info.major}.{sys.version_info.minor}")
+        print("Please install Python 3.12 or higher:")
+        print("  sudo apt install python3.12  # Debian/Ubuntu")
+        print("  sudo dnf install python3.12  # Fedora")
+        print("  brew install python3.12      # macOS")
+        sys.exit(1)
 
-def chunk_reader(fobj, chunk_size=1024):
-	"""Generator that reads a file in chunks of bytes"""
-	while True:
-		chunk = fobj.read(chunk_size)
-		if not chunk:
-			return
-		yield chunk
 
-def get_hash(filename, first_chunk_only=False, hash=hashlib.sha1):
-	hashobj = hash()
-	file_object = open(filename, 'rb')
+check_python_version()
 
-	if first_chunk_only:
-		size = int(args.miniSize[0])
-		hashobj.update(file_object.read(size))
-	else:
-		for chunk in chunk_reader(file_object):
-			hashobj.update(chunk)
-	hashed = hashobj.digest()
-	file_object.close()
-	return hashed
 
-dupeList = list()
-def checkHashExists(full_hash):
-	i = 0
-	for dupe in dupeList:
-		if full_hash == dupe.hash:
-			return i
-		i = i + 1
-	return None
+@dataclass
+class DuplicateGroup:
+    """Represents a group of duplicate files."""
+    hash_value: bytes
+    files: list[Path] = field(default_factory=list)
+    
+    @property
+    def count(self) -> int:
+        return len(self.files)
+    
+    @property
+    def total_size(self) -> int:
+        """Total size of all files in this group."""
+        total = 0
+        for f in self.files:
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+        return total
 
-vmFileList = [".vmdk",".vmx",".vmsd",".vmxf",".lck",".appinfo",".nvram",".vmem",".vmss"]
-vmPathList = list()
-def check_not_in_exclude(dirpath, filename):
-	full_path = os.path.join(dirpath, filename).lower()
-	if(args.exclude):
-		for excludeString in args.exclude:
-			if not (full_path.find(excludeString) == -1):
-				logging.info ("Excluding due to %s being found in %s", excludeString, full_path)
-				return False
-	for excludePath in vmPathList:
-		if not (dirpath.find(excludePath) == -1):
-			logging.info ("Excluding due to %s path found in %s", excludePath, full_path)
-			return False
-	if(args.incVMs):
-		for excludeString in vmFileList:
-			if not (full_path.find(excludeString) == -1):
-				logging.info ("Excluding due to %s being found in %s", excludeString, full_path)
-				vmPathList.append(dirpath)
-				return False
-	return True
 
-mediaFileList = [".jpg",".jpeg",".bmp",".tiff",".gif",".mov",".mp3",".mp4",".wav",".mpeg",".mpg",".png",".tif"]
-mediaPathList = list()
-def check_in_include(dirpath, filename):
-	full_path = os.path.join(dirpath, filename).lower()
-	#if(args.incMedia):
-	#for includeString in vmFileList:
-	#	if (full_path.find(includeString) == -1):
-	#		logging.info ("Including due to %s being found in %s", includeString, full_path)
-	#		mediaPathList.append(dirpath)
-	#		return False
-	if(args.include):
-		for includeString in args.include:
-			if not (full_path.find(includeString.lower()) == -1):
-				return True
-	else:
-		return True
-	return False
+@dataclass
+class ScanResult:
+    """Results from a duplicate scan."""
+    duplicates: list[DuplicateGroup] = field(default_factory=list)
+    files_scanned: int = 0
+    unique_sizes: int = 0
+    duplicate_files: int = 0
+    
+    @property
+    def duplicate_groups(self) -> int:
+        return len(self.duplicates)
 
-def check_for_duplicates(paths, hash=hashlib.sha1):
-	hashes_by_size = {}
-	hashes_on_1k = {}
-	hashes_full = {}
-	fileCount = 0
-	searchedMiniHashCount = 0
-	searchedHashCount = 0
-	duplicateFileCount = 0
-	dupeHashCount = 0 #Estimated amount to be deleted
-	print("=========================================================================")
-	print ("Checking for duplicate file sizes", paths)
-	for path in paths:
-		for dirpath, dirnames, filenames in os.walk(path):
-			for filename in filenames:
-				full_path = os.path.join(dirpath, filename)
-				#If not in exclude lists process.
-				if (check_not_in_exclude(dirpath, filename) & check_in_include(dirpath, filename)):
-					#Get path and size
-					try:
-						# if the target is a symlink (soft one), this will 
-						# dereference it - change the value to the actual target file
-						full_path = os.path.realpath(full_path)
-						file_size = os.path.getsize(full_path)
-					except (OSError,):
-						# not accessible (permissions, etc) - pass on
-						continue
-					#Return index of matched if duplicate exists
-					duplicate = hashes_by_size.get(file_size)
 
-					if duplicate:
-						hashes_by_size[file_size].append(full_path)
-					else:
-						hashes_by_size[file_size] = []	# create the list for this file size
-						hashes_by_size[file_size].append(full_path)
-					fileCount += 1
-	print("Searched",fileCount ,"files.")
-	print("Found",len(hashes_by_size),"different file sizes.")
-	print("=========================================================================")
-	# For all files with the same file size, get their hash on the 1st 1024 bytes
-	print ("Checking for duplicate mini hash")
-	for __, files in hashes_by_size.items():
-		if len(files) < 2:
-			continue	# this file size is unique, no need to spend cpy cycles on it
+class DuplicateFinder:
+    """Finds duplicate files using a multi-stage hashing approach."""
+    
+    def __init__(self, 
+                 mini_hash_size: int = DEFAULT_MINI_HASH_SIZE,
+                 chunk_size: int = DEFAULT_CHUNK_SIZE,
+                 hash_algorithm: str = "sha1"):
+        self.mini_hash_size = mini_hash_size
+        self.chunk_size = chunk_size
+        self.hash_algorithm = hash_algorithm
+        self.logger = logging.getLogger(__name__)
+        
+    def _get_hash_object(self):
+        """Get a fresh hash object based on the configured algorithm."""
+        return hashlib.new(self.hash_algorithm)
+    
+    def _read_file_chunks(self, file_path: Path):
+        """Generator that yields chunks from a file."""
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(self.chunk_size):
+                yield chunk
+    
+    def get_partial_hash(self, file_path: Path) -> bytes:
+        """Get hash of first N bytes (mini hash)."""
+        hash_obj = self._get_hash_object()
+        with open(file_path, 'rb') as f:
+            hash_obj.update(f.read(self.mini_hash_size))
+        return hash_obj.digest()
+    
+    def get_full_hash(self, file_path: Path) -> bytes:
+        """Get hash of entire file."""
+        hash_obj = self._get_hash_object()
+        for chunk in self._read_file_chunks(file_path):
+            hash_obj.update(chunk)
+        return hash_obj.digest()
+    
+    def should_exclude_path(self, path: Path, exclude_patterns: Optional[list[str]] = None) -> bool:
+        """Check if path should be excluded based on patterns."""
+        if not exclude_patterns:
+            return False
+        
+        path_str = str(path).lower()
+        return any(pattern.lower() in path_str for pattern in exclude_patterns)
+    
+    def should_include_path(self, path: Path, include_patterns: Optional[list[str]] = None) -> bool:
+        """Check if path should be included based on patterns."""
+        if not include_patterns:
+            return True
+        
+        path_str = str(path).lower()
+        return any(pattern.lower() in path_str for pattern in include_patterns)
+    
+    def _is_media_file(self, file_path: Path) -> bool:
+        """Check if file is a media file based on extension."""
+        return file_path.suffix.lower() in MEDIA_EXTENSIONS
+    
+    def scan_for_duplicates(self, 
+                           paths: list[Path], 
+                           exclude_patterns: Optional[list[str]] = None,
+                           include_patterns: Optional[list[str]] = None,
+                           exclude_vm_files: bool = True,
+                           media_only: bool = False) -> ScanResult:
+        """
+        Scan directories for duplicate files.
+        
+        Uses a three-stage approach for efficiency:
+        1. Group by file size (fast)
+        2. Hash first N bytes (medium)
+        3. Hash entire file (thorough)
+        """
+        result = ScanResult()
+        
+        # Stage 1: Group by file size
+        self.logger.info("Stage 1: Grouping files by size...")
+        files_by_size: dict[int, list[Path]] = {}
+        
+        for search_path in paths:
+            for file_path in search_path.rglob('*'):
+                if not file_path.is_file():
+                    continue
+                
+                # Check if media-only mode is enabled
+                if media_only and not self._is_media_file(file_path):
+                    continue
+                
+                # Check exclusions/inclusions
+                if self.should_exclude_path(file_path, exclude_patterns):
+                    continue
+                if not self.should_include_path(file_path, include_patterns):
+                    continue
+                
+                # Skip VM files if configured
+                if exclude_vm_files and file_path.suffix.lower() in VM_EXTENSIONS:
+                    continue
+                
+                try:
+                    # Resolve symlinks to avoid duplicates from symlinks
+                    real_path = file_path.resolve()
+                    size = real_path.stat().st_size
+                    
+                    if size not in files_by_size:
+                        files_by_size[size] = []
+                    files_by_size[size].append(real_path)
+                    result.files_scanned += 1
+                    
+                except (OSError, PermissionError) as e:
+                    self.logger.debug(f"Cannot access {file_path}: {e}")
+                    continue
+        
+        result.unique_sizes = len(files_by_size)
+        self.logger.info(f"Found {result.files_scanned} files with {result.unique_sizes} unique sizes")
+        
+        # Stage 2: Hash first N bytes for files with same size
+        self.logger.info("Stage 2: Computing partial hashes...")
+        hashes_by_partial: dict[bytes, list[Path]] = {}
+        
+        for size, file_list in files_by_size.items():
+            if len(file_list) < 2:
+                continue  # Unique size, skip
+            
+            for file_path in file_list:
+                try:
+                    partial_hash = self.get_partial_hash(file_path)
+                    if partial_hash not in hashes_by_partial:
+                        hashes_by_partial[partial_hash] = []
+                    hashes_by_partial[partial_hash].append(file_path)
+                except (OSError, PermissionError):
+                    continue
+        
+        self.logger.info(f"Found {len(hashes_by_partial)} files with matching partial hashes")
+        
+        # Stage 3: Full hash for final duplicate detection
+        self.logger.info("Stage 3: Computing full hashes...")
+        hashes_full: dict[bytes, DuplicateGroup] = {}
+        
+        for partial_hash, file_list in hashes_by_partial.items():
+            if len(file_list) < 2:
+                continue
+            
+            for file_path in file_list:
+                try:
+                    full_hash = self.get_full_hash(file_path)
+                    
+                    if full_hash in hashes_full:
+                        hashes_full[full_hash].files.append(file_path)
+                    else:
+                        hashes_full[full_hash] = DuplicateGroup(
+                            hash_value=full_hash,
+                            files=[file_path]
+                        )
+                except (OSError, PermissionError):
+                    continue
+        
+        # Convert to list, filter to only actual duplicates
+        result.duplicates = [dg for dg in hashes_full.values() if dg.count > 1]
+        result.duplicate_files = sum(dg.count for dg in result.duplicates)
+        
+        self.logger.info(f"Found {result.duplicate_files} duplicate files in {len(result.duplicates)} groups")
+        
+        return result
 
-		for filename in files:
-			try:
-				small_hash = get_hash(filename, first_chunk_only=True)
-			except (OSError,):
-				# the file access might've changed till the exec point got here 
-				continue
 
-			duplicate = hashes_on_1k.get(small_hash)
-			if duplicate:
-				hashes_on_1k[small_hash].append(filename)
-			else:
-				hashes_on_1k[small_hash] = []		  # create the list for this 1k hash
-				hashes_on_1k[small_hash].append(filename)
-			searchedMiniHashCount += 1
+class DuplicateManager:
+    """Manages duplicate file deletion and reporting."""
+    
+    def __init__(self, scan_result: ScanResult):
+        self.scan_result = scan_result
+        self.delete_candidates: list[Path] = []
+        self.keep_paths: list[Path] = []
+        
+    def set_priority_paths(self, paths: list[str]):
+        """Set paths that should be kept when deleting duplicates."""
+        self.keep_paths = [Path(p).resolve() for p in paths]
+        
+    def select_duplicates_to_delete(self):
+        """
+        Select which duplicates to delete.
+        
+        Strategy: Keep files in priority paths, delete from others.
+        For each duplicate group, keep the first file, mark rest for deletion.
+        """
+        for group in self.scan_result.duplicates:
+            # Sort files: priority paths first, then by path length (shorter = more likely to be original)
+            sorted_files = sorted(
+                group.files,
+                key=lambda f: (
+                    not any(self._is_subpath(f, p) for p in self.keep_paths),
+                    len(str(f))
+                )
+            )
+            
+            # Keep first file, mark rest for deletion
+            for file_path in sorted_files[1:]:
+                if file_path.exists():
+                    self.delete_candidates.append(file_path)
+    
+    def _is_subpath(self, path: Path, parent: Path) -> bool:
+        """Check if path is under parent directory."""
+        try:
+            path.resolve().relative_to(parent.resolve())
+            return True
+        except ValueError:
+            return False
+    
+    def delete_files(self, dry_run: bool = True) -> tuple[int, int]:
+        """
+        Delete selected files.
+        
+        Returns:
+            Tuple of (success_count, failure_count)
+        """
+        success = 0
+        failed = 0
+        
+        for file_path in self.delete_candidates:
+            try:
+                if dry_run:
+                    print(f"[DRY RUN] Would delete: {file_path}")
+                else:
+                    file_path.unlink()
+                    print(f"Deleted: {file_path}")
+                success += 1
+            except OSError as e:
+                print(f"Failed to delete {file_path}: {e}")
+                failed += 1
+        
+        return success, failed
+    
+    def save_results(self, base_path: Path = Path(".")):
+        """Save scan results to files."""
+        # Save duplicate groups
+        output_file = base_path / "duplicate_groups.txt"
+        with open(output_file, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("DUPLICATE FILES REPORT\n")
+            f.write("=" * 60 + "\n\n")
+            
+            for i, group in enumerate(self.scan_result.duplicates, 1):
+                f.write(f"Group {i} ({group.count} files, {group.total_size:,} bytes):\n")
+                for file_path in group.files:
+                    f.write(f"  - {file_path}\n")
+                f.write("\n")
+        
+        # Save deletion list
+        delete_file = base_path / "delete_list.txt"
+        with open(delete_file, 'w') as f:
+            for file_path in self.delete_candidates:
+                f.write(f"{file_path}\n")
+        
+        # Save serialized data for delete mode
+        data_file = base_path / "scan_data.pkl"
+        with open(data_file, 'wb') as f:
+            pickle.dump(self.scan_result, f)
+        
+        # Save priority paths
+        paths_file = base_path / "priority_paths.txt"
+        with open(paths_file, 'w') as f:
+            for path in self.keep_paths:
+                f.write(f"{path}\n")
+        
+        return output_file, delete_file
+    
+    @classmethod
+    def load_results(cls, base_path: Path = Path(".")) -> 'DuplicateManager':
+        """Load previous scan results for deletion."""
+        data_file = base_path / "scan_data.pkl"
+        with open(data_file, 'rb') as f:
+            scan_result = pickle.load(f)
+        
+        manager = cls(scan_result)
+        
+        # Load priority paths
+        paths_file = base_path / "priority_paths.txt"
+        if paths_file.exists():
+            with open(paths_file, 'r') as f:
+                manager.keep_paths = [Path(line.strip()) for line in f if line.strip()]
+        
+        return manager
 
-	print("Searched",searchedMiniHashCount, "files.")
-	print("Found",len(hashes_on_1k) ,"unique files with possible duplicates.")
-	print("=========================================================================")
-	# For all files with the hash on the 1st 1024 bytes, get their hash on the full file - collisions will be duplicates
-	print ("Checking for duplicate full hash")
-	for __, files in hashes_on_1k.items():
-		if len(files) < 2:
-			continue	# this hash of fist 1k file bytes is unique, no need to spend cpy cycles on it
 
-		for filename in files:
-			try: 
-				full_hash = get_hash(filename, first_chunk_only=False)
-			except (OSError,):
-				# the file access might've changed till the exec point got here 
-				continue
-			duplicate = hashes_full.get(full_hash)
-			if duplicate:
-				duplicateFileCount += 1
-				dupeHashCount += 1
-				exists = checkHashExists(full_hash)
-				if (exists != None) :	#Add to existing duplicate list
-					dupeList[exists].filename.append(filename)				
-					dupeList[exists].name.append(getName(filename))
-					dupeList[exists].path.append(getPath(filename))
-					dupeList[exists].dupeCount += 1
-				else:	#New Duplicate Entry
-					newDupe = duplicateItem()
-					newDupe.hash = full_hash
+def setup_logging(log_file: str = "find.log"):
+    """Configure logging to file and console."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
 
-					newDupe.filename.append(filename)
-					newDupe.name.append(getName(filename))
-					newDupe.path.append(getPath(filename))
 
-					newDupe.filename.append(duplicate)
-					newDupe.name.append(getName(duplicate))
-					newDupe.path.append(getPath(duplicate))
-					newDupe.dupeCount = 2
-					dupeList.append(newDupe)
-					dupeHashCount += 1
-			else:
-				hashes_full[full_hash] = filename
-			searchedHashCount += 1
+def validate_arguments(args) -> list[Path]:
+    """Validate command line arguments."""
+    if args.mode == 'find' and not args.target:
+        print("Error: --target is required in find mode")
+        sys.exit(1)
+    
+    if not args.target:
+        return []
+    
+    # Convert to Path objects and validate
+    target_paths = [Path(t).resolve() for t in args.target]
+    
+    for path in target_paths:
+        if not path.exists():
+            print(f"Error: Path does not exist: {path}")
+            sys.exit(1)
+    
+    # Check for duplicate paths
+    if len(target_paths) != len(set(target_paths)):
+        print("Error: Duplicate paths provided")
+        sys.exit(1)
+    
+    # Check for parent/child relationships
+    for i, path1 in enumerate(target_paths):
+        for path2 in target_paths[i+1:]:
+            try:
+                path1.relative_to(path2)
+                print(f"Error: '{path1}' is a subdirectory of '{path2}'")
+                sys.exit(1)
+            except ValueError:
+                pass
+            try:
+                path2.relative_to(path1)
+                print(f"Error: '{path2}' is a subdirectory of '{path1}'")
+                sys.exit(1)
+            except ValueError:
+                pass
+    
+    return target_paths
 
-	print("Searched",searchedHashCount, "files.")
-	print("Found",dupeHashCount ,"duplicate files(total).")
-	print("Found",duplicateFileCount ,"duplicates viable for deletion.")
-	
-	print("=========================================================================")
 
-def getDupePaths():
-	pathList = list()
-	for dupe in dupeList:
-		for path in dupe.path:
-			pathList.append(path)
-	return sorted(list(set(pathList)), key=len, reverse=True)
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description='Find and optionally delete duplicate files.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --mode find --target /home/user/documents
+  %(prog)s --mode find --target /path1 /path2 --exclude ".git" "node_modules"
+  %(prog)s --mode delete
+  %(prog)s --mode dryrun
+        """
+    )
+    
+    parser.add_argument(
+        '--mode', 
+        choices=['find', 'delete', 'dryrun'],
+        required=True,
+        help='Operation mode: find (scan only), delete (actually delete), dryrun (simulate delete)'
+    )
+    parser.add_argument(
+        '--target',
+        nargs='+',
+        help='Directory(ies) to search for duplicates'
+    )
+    parser.add_argument(
+        '--exclude',
+        nargs='*',
+        help='Strings to exclude from search (case-insensitive)'
+    )
+    parser.add_argument(
+        '--include',
+        nargs='*',
+        help='Only include files matching these strings (case-insensitive)'
+    )
+    parser.add_argument(
+        '--media',
+        action='store_true',
+        help='Only search media files (photos, videos, audio)'
+    )
+    parser.add_argument(
+        '--mini-hash-size',
+        type=int,
+        default=DEFAULT_MINI_HASH_SIZE,
+        help=f'Size in bytes for partial hash (default: {DEFAULT_MINI_HASH_SIZE})'
+    )
+    parser.add_argument(
+        '--include-vm',
+        action='store_true',
+        help='Include VM files in duplicate detection'
+    )
+    parser.add_argument(
+        '--log-file',
+        default='find.log',
+        help='Log file path (default: find.log)'
+    )
+    
+    args = parser.parse_args()
+    
+    setup_logging(args.log_file)
+    logger = logging.getLogger(__name__)
+    start_time = time.time()
+    
+    try:
+        if args.mode == 'find':
+            # Validate and get target paths
+            target_paths = validate_arguments(args)
+            
+            logger.info(f"Starting duplicate scan in: {target_paths}")
+            logger.info(f"Exclude patterns: {args.exclude}")
+            logger.info(f"Include patterns: {args.include}")
+            logger.info(f"Media only mode: {args.media}")
+            
+            # Create finder and scan
+            finder = DuplicateFinder(mini_hash_size=args.mini_hash_size)
+            result = finder.scan_for_duplicates(
+                paths=target_paths,
+                exclude_patterns=args.exclude,
+                include_patterns=args.include,
+                exclude_vm_files=not args.include_vm,
+                media_only=args.media
+            )
+            
+            # Create manager and save results
+            manager = DuplicateManager(result)
+            manager.set_priority_paths([str(p) for p in target_paths])
+            output_file, delete_file = manager.save_results()
+            
+            # Print summary
+            print("\n" + "=" * 60)
+            print("SCAN COMPLETE")
+            print("=" * 60)
+            print(f"Files scanned:      {result.files_scanned}")
+            print(f"Unique sizes:       {result.unique_sizes}")
+            print(f"Duplicate groups:   {result.duplicate_groups}")
+            print(f"Duplicate files:    {result.duplicate_files}")
+            print(f"\nResults saved to:")
+            print(f"  - {output_file}")
+            print(f"  - {delete_file}")
+            
+        elif args.mode in ('delete', 'dryrun'):
+            # Load previous results
+            logger.info(f"Loading previous scan results...")
+            manager = DuplicateManager.load_results()
+            
+            # Select files to delete
+            manager.select_duplicates_to_delete()
+            
+            print(f"\nFiles marked for deletion: {len(manager.delete_candidates)}")
+            
+            # Perform deletion
+            success, failed = manager.delete_files(dry_run=(args.mode == 'dryrun'))
+            
+            print(f"\nDeletion complete: {success} deleted, {failed} failed")
+            
+            # Update delete list
+            with open("delete_list.txt", 'w') as f:
+                for path in manager.delete_candidates:
+                    if path.exists():
+                        f.write(f"{path}\n")
+        
+    except KeyboardInterrupt:
+        logger.info("Operation cancelled by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(f"Error: {e}")
+        sys.exit(1)
+    
+    elapsed = time.time() - start_time
+    print(f"\nCompleted in {elapsed:.3f} seconds")
 
-delListPath = list()
-delList = list()
-delPaths = list()
-def addToDeletion():
-	# print ("Unique Files: ", len(dupeList))
-	for dupe in dupeList:	#Loop through each set of duplicates
-		# print ("Count of this file: ", dupe.dupeCount)
-		tryCount = 0	#Overall attempt count
-		delIndex = 0	#Index of paths to check through
-		maxCheckLen = len(delListPath)*len(dupe.filename)
-		check = True
-		while (len(dupe.filename) > 1 and check ):	#Loop until only one item left or break.
-			try:
-				index = dupe.path.index(delListPath[delIndex])	#If path is (ith) delete path return index.
-			except:
-				delIndex += 1
-				if delIndex > len(delListPath):
-					check = False
-				continue
-			else:
-				#Add file and path to delete list
-				delList.append(dupe.filename[index])
-				delPaths.append(dupe.path[index])
-				#Find & remove from current dupe set
-				dupe.filename.remove(dupe.filename[index])
-				dupe.name.remove(dupe.name[index])
-				dupe.path.remove(dupe.path[index])
-			tryCount += 1
-			if(tryCount > maxCheckLen):
-				raise ValueError('addToDeletion: tryCount exceeded macCheckLen. This should not happen.')
-				check = False
-		# print ("Try Count: ",tryCount, "CheckLen: ", maxCheckLen)
 
-def pathsToFile():
-	with open('duplicate_files_path_list.txt', 'w') as filehandle:
-		for listitem in getDupePaths():
-			filehandle.write('%s\n' % listitem)
-
-def pathsFromFile():
-	with open('duplicate_files_path_list.txt', 'r') as filehandle:
-		for line in filehandle:
-			currentPlace = line[:-1]
-			delListPath.append(currentPlace)
-
-def filesToFile():
-	with open('duplicate_file_list.txt', 'w') as filehandle:
-		for dupe in dupeList:
-			filehandle.write('%s\n' % dupe.filename)
-
-def deleteToFile():
-	with open('delete_file_list.txt', 'w') as filehandle:
-		for fname in delList:
-			filehandle.write('%s\n' % fname)
-			
-def hashedListToFile():
-	with open('hashed_list.dat', 'wb') as filehandle:
-		pickle.dump(dupeList, filehandle)
-		filehandle.close()
-
-def hashedListFromFile():
-	with open('hashed_list.dat', 'rb') as filehandle:
-		newList = pickle.load(filehandle)
-		filehandle.close()
-	return newList
-
-def deleteItems():
-	logging.info ("Number of items for deletion: %s", len(delList))
-	for item in delList:
-		os.remove(item)
-		pass
-
-def checkArgs(targets):
-	#Check for duplicates
-	for target in targets:
-		if (targets.count(target) > 1):
-			logging.error("ERROR: duplicate paths not allowed.")
-			goodbye()
-	#Check for substring - Forward
-	targetList = targets.copy()
-	while(len(targetList) > 0):
-		test = targetList.pop()
-		if any(test in s for s in targetList):
-			logging.error("ERROR: Target folder list must not contain their own children.")
-			goodbye()
-	#Check for substring - Backward
-	targetList = targets.copy()
-	while(len(targetList) > 0):
-		test = targetList.pop(0)
-		if any(test in s for s in targetList):
-			logging.error("ERROR: Target folder list must not contain their own children.")
-			goodbye()
-
-# Argument parser and program initiliisiiaizion
-parser = argparse.ArgumentParser(description='Check for duplicates and delete them.')
-parser.add_argument('--mode', metavar='[find/delete/dryrun]', type=str, dest='mode', nargs=1, default='find', required=True,
-					help='[find] Find duplicates.\n [delete] delete duplicates.\n [dryrun] Run delete without actually deleting.')
-parser.add_argument('--target', metavar='target',dest='target', type=str, nargs='*', required=False,
-					help='destinations(s) to check for duplicates.')
-parser.add_argument('--exclude', metavar='str',dest='exclude', type=str, nargs='*', required=False,
-					help="""Strings in the filename or path to exlcude from duplicate list.
-					Any in the list will result in exclusion. \"OR function\".
-					Case insensitive. Exclude overrides Include.""")
-parser.add_argument('--include', metavar='str',dest='include', type=str, nargs='*', required=False,
-					help="""Strings which must be present in filename or path to add to duplicate list.
-					Any in the list will result in inclusion. \"OR function\".
-					Case insensitive. Exclude overrides Include.""")
-parser.add_argument('--miniHashSize', metavar='bytes',dest='miniSize', type=int, nargs=1, required=False, default=[1024],
-					help='Size (in Bytes) to use for Mini Hash check.')
-parser.add_argument('--incvms', dest='incVMs', default=True, const=False, nargs='?',
-					required=False, help='Setting [True] allows deletion of detected Virtual Machine files which may have valid duplicates.')
-parser.add_argument('--media', dest='incMedia', default=False, const=False, nargs='?',
-					required=False, help='Setting [True] searched only media files.')
-
-args = parser.parse_args()
-logging.basicConfig(filename='find.log',level=logging.INFO)
-
-if (args.mode[0].lower() == "find"):
-	targetList = args.target
-	print ("Find Mode")
-	checkArgs(targetList)
-	print ("Exclude List: ", args.exclude)
-	check_for_duplicates(args.target)
-	hashedListToFile()
-	pathsToFile()
-	filesToFile()
-elif (args.mode[0].lower() == "delete"):
-	print ("Delete Mode")
-	dupeList = hashedListFromFile()
-	pathsFromFile()
-	addToDeletion()
-	deleteToFile()
-	deleteItems()
-elif (args.mode[0].lower() == "dryrun"):
-	print ("Dry Run")
-	dupeList = hashedListFromFile()
-	pathsFromFile()
-	addToDeletion()
-	deleteToFile()
-else:
-	goodbye()
-print("%.3f seconds" % (time.time() - start_time))
+if __name__ == "__main__":
+    main()
