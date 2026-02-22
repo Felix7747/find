@@ -25,4 +25,5 @@ sudo apt update
 sudo apt install python3.12
 ```
 **Synology:**
+
 Install python3.12 from community packages.
